@@ -14,10 +14,10 @@ import (
 )
 
 var (
-	jenkinsUrl  = os.Getenv("JENKINS_HOST")
-	jenkinsUser = os.Getenv("JENKINS_USER")
-	jenkinsPass = os.Getenv("JENKINS_PASS")
-	listenPort  = getEnvDefault("LISTEN_PORT", ":9001")
+	jenkinsUrl   = os.Getenv("JENKINS_HOST")
+	jenkinsUser  = os.Getenv("JENKINS_USER")
+	jenkinsToken = os.Getenv("JENKINS_TOKEN")
+	listenPort   = getEnvDefault("LISTEN_PORT", ":9001")
 )
 
 func getEnvDefault(key, fallback string) string {
@@ -29,7 +29,7 @@ func getEnvDefault(key, fallback string) string {
 
 func main() {
 	ctx := context.Background()
-	jenkins := gojenkins.CreateJenkins(nil, jenkinsUrl, jenkinsUser, jenkinsPass)
+	jenkins := gojenkins.CreateJenkins(nil, jenkinsUrl, jenkinsUser, jenkinsToken)
 
 	_, err := jenkins.Init(ctx)
 	if err != nil {
