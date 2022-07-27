@@ -26,7 +26,7 @@ var (
 	numBuilds = prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, "", "build_count"),
 		"Number of jenkins builds run",
-		[]string{"job_name"},
+		[]string{"job_name", "build_status"},
 		nil,
 	)
 )
@@ -42,10 +42,12 @@ type Exporter struct {
 }
 
 type ExporterState struct {
-	lastJobRefresh time.Time
-	jobs           []*gojenkins.Job
-	buildCount     map[string]int
-	up             int
+	lastJobRefresh  time.Time
+	jobs            []*gojenkins.Job
+	lastBuildID     map[string]int64
+	buildCounter    map[string]map[string]int64
+	inProgressQueue map[string][]*gojenkins.Build
+	up              int
 }
 
 func NewExporter(jenkinsClient *gojenkins.Jenkins) Exporter {
@@ -54,7 +56,9 @@ func NewExporter(jenkinsClient *gojenkins.Jenkins) Exporter {
 		JobRefreshInterval: 10 * time.Second,
 		Ctx:                context.Background(),
 		state: ExporterState{
-			buildCount: make(map[string]int),
+			lastBuildID:     make(map[string]int64),
+			buildCounter:    make(map[string]map[string]int64),
+			inProgressQueue: make(map[string][]*gojenkins.Build),
 		},
 	}
 }
@@ -69,8 +73,10 @@ func (e *Exporter) Collect(ch chan<- prometheus.Metric) {
 	ch <- prometheus.MustNewConstMetric(numJobs, prometheus.GaugeValue, float64(len(e.state.jobs)))
 	ch <- prometheus.MustNewConstMetric(up, prometheus.GaugeValue, float64(e.state.up))
 
-	for job, count := range e.state.buildCount {
-		ch <- prometheus.MustNewConstMetric(numBuilds, prometheus.GaugeValue, float64(count), job)
+	for job, statusCount := range e.state.buildCounter {
+		for status, count := range statusCount {
+			ch <- prometheus.MustNewConstMetric(numBuilds, prometheus.CounterValue, float64(count), job, status)
+		}
 	}
 }
 
@@ -91,8 +97,44 @@ func (e *Exporter) refreshJobs() {
 	}).Info("Job list update finished")
 }
 
-func (e *Exporter) countBuildsForJob(job *gojenkins.Job) int {
-	var builds int
+func (e *Exporter) countBuildsForJob(job *gojenkins.Job) map[string]int64 {
+	builds := make(map[string]int64)
+
+	if len(e.state.inProgressQueue[job.Base]) > 0 {
+		log.WithFields(log.Fields{
+			"job": job.Base,
+		}).Infof("Re-processing previously in-progress builds")
+
+		for i, build := range e.state.inProgressQueue[job.Base] {
+			build, err := job.GetBuild(e.Ctx, build.GetBuildNumber())
+			if err != nil {
+				log.WithFields(log.Fields{
+					"job":   job.Base,
+					"build": build.GetBuildNumber(),
+				}).Errorf("Error getting details for build: %s", err)
+				continue
+			}
+
+			if build.Raw.Building {
+				log.WithFields(log.Fields{
+					"job":   job.Base,
+					"build": build.GetBuildNumber(),
+				}).Infof("Job was still building, skipping.")
+
+				continue
+			}
+
+			log.WithFields(log.Fields{
+				"job":    job.Base,
+				"build":  build.GetBuildNumber(),
+				"status": build.Raw.Result,
+			}).Infof("Previously building job is now finished.")
+
+			builds[build.Raw.Result] = builds[build.Raw.Result] + 1
+
+			e.state.inProgressQueue[job.Base] = append(e.state.inProgressQueue[job.Base][:i], e.state.inProgressQueue[job.Base][i+1:]...)
+		}
+	}
 
 	buildIds, err := job.GetAllBuildIds(e.Ctx)
 	if err != nil {
@@ -101,7 +143,48 @@ func (e *Exporter) countBuildsForJob(job *gojenkins.Job) int {
 		}).Errorf("Error getting builds for job: %s", err)
 	}
 
-	builds = len(buildIds)
+	for _, id := range buildIds {
+		if _, ok := e.state.lastBuildID[job.Base]; !ok {
+			e.state.lastBuildID[job.Base] = id.Number
+			break
+		}
+
+		if e.state.lastBuildID[job.Base] == id.Number {
+			break
+		}
+
+		buildDetails, err := job.GetBuild(e.Ctx, id.Number)
+		if err != nil {
+			log.WithFields(log.Fields{
+				"job":   job.Base,
+				"build": id.Number,
+			}).Errorf("Error getting details for build: %s", err)
+			continue
+		}
+
+		if buildDetails.Raw.Building {
+			log.WithFields(log.Fields{
+				"job":   job.Base,
+				"build": id.Number,
+			}).Infof("Job was still building, adding to queue.")
+
+			e.state.inProgressQueue[job.Base] = append(e.state.inProgressQueue[job.Base], buildDetails)
+
+			continue
+		}
+
+		log.WithFields(log.Fields{
+			"job":    job.Base,
+			"build":  id.Number,
+			"status": buildDetails.Raw.Result,
+		}).Infof("Retrieved details for build")
+
+		builds[buildDetails.Raw.Result] = builds[buildDetails.Raw.Result] + 1
+	}
+
+	if len(buildIds) > 0 {
+		e.state.lastBuildID[job.Base] = buildIds[0].Number
+	}
 
 	if len(job.GetInnerJobsMetadata()) > 0 {
 		innerJobs, err := job.GetInnerJobs(e.Ctx)
@@ -112,11 +195,20 @@ func (e *Exporter) countBuildsForJob(job *gojenkins.Job) int {
 		}
 
 		for _, job := range innerJobs {
-			builds = builds + e.countBuildsForJob(job)
+			for status, count := range e.countBuildsForJob(job) {
+				builds[status] = builds[status] + count
+			}
 		}
 	}
 
-	e.state.buildCount[job.Base] = builds
+	for status, count := range builds {
+		if _, ok := e.state.buildCounter[job.Base]; !ok {
+			e.state.buildCounter[job.Base] = make(map[string]int64)
+		}
+
+		e.state.buildCounter[job.Base][status] = e.state.buildCounter[job.Base][status] + count
+	}
+
 	return builds
 }
 
